@@ -8,12 +8,14 @@
 # What this script does
 #   1. Lets you pick Dahl or a custom OpenAI-compatible endpoint + model
 #   2. Installs a PINNED ant2oai (a2o) version into ~/ant2oia/.venv
-#   3. Applies four small compatibility patches to a2o (each one checked first):
+#   3. Applies five small compatibility patches to a2o (each one checked first):
 #        - parser.py   accept role="system" entries inside messages[]
 #        - request.py  fold the system prompt into the first user message
 #                      (for endpoints that reject role="system")
 #        - response.py DeepSeek DSML tool calls -> Anthropic tool_use
 #        - streaming.py same, for streamed responses
+#        - request.py  strip regex lookahead/lookbehind "pattern" values from tool
+#                      JSON schemas (upstream rejects them as invalid regex)
 #   4. Runs offline tests, then (optionally) a live smoke test
 #   5. Writes config.env (600), a launcher, and your VS Code settings
 #
@@ -333,6 +335,7 @@ import sys
 from pathlib import Path
 
 MARK = "A2O-DSML-PATCH"
+SCHEMA_MARK = "A2O-SCHEMA-PATCH"
 
 
 def pkg_dir():
@@ -530,11 +533,34 @@ STREAMING = [
 '''),
 ]
 
+# ---- request.py: strip unsupported regex "pattern" from tool schemas ---------
+# Some tools (e.g. Claude Code's) ship JSON-schema patterns using lookaheads like (?!...),
+# which certain OpenAI-compatible backends reject. Drop only those patterns.
+SCHEMA = [
+    ('def _tools_to_openai(tools)',
+     '''def _sanitize_schema(value):  # A2O-SCHEMA-PATCH
+    if isinstance(value, dict):
+        return {
+            k: _sanitize_schema(v)
+            for k, v in value.items()
+            if not (k == "pattern" and isinstance(v, str) and "(?" in v)
+        }
+    if isinstance(value, list):
+        return [_sanitize_schema(v) for v in value]
+    return value
+
+
+def _tools_to_openai(tools)'''),
+    ('params = dict(tool.input_schema)',
+     'params = _sanitize_schema(tool.input_schema)  # A2O-SCHEMA-PATCH'),
+]
+
 FILES = {
-    "parser": ("converters/parser.py", PARSER),
-    "request": ("converters/request.py", REQUEST),
-    "response": ("converters/response.py", RESPONSE),
-    "streaming": ("converters/streaming.py", STREAMING),
+    "parser": ("converters/parser.py", PARSER, MARK),
+    "request": ("converters/request.py", REQUEST, MARK),
+    "schema": ("converters/request.py", SCHEMA, SCHEMA_MARK),
+    "response": ("converters/response.py", RESPONSE, MARK),
+    "streaming": ("converters/streaming.py", STREAMING, MARK),
 }
 
 DSML_SOURCE = r'''"""Parse DeepSeek DSML tool calls into OpenAI-style tool calls.  A2O-DSML-PATCH"""
@@ -618,9 +644,9 @@ def parse_dsml_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
 '''
 
 
-def state(path, pairs):
+def state(path, pairs, mark):
     text = path.read_text(encoding="utf-8")
-    if MARK in text:
+    if mark in text:
         return "patched"
     if all(old in text for old, _ in pairs):
         return "pristine"
@@ -630,7 +656,7 @@ def state(path, pairs):
 def main():
     cmd = sys.argv[1] if len(sys.argv) > 1 else "status"
     base = pkg_dir()
-    states = {n: state(base / rel, pairs) for n, (rel, pairs) in FILES.items()}
+    states = {n: state(base / rel, pairs, mark) for n, (rel, pairs, mark) in FILES.items()}
 
     if cmd == "status":
         for n, s in states.items():
@@ -647,7 +673,7 @@ def main():
 
     touched = []
     try:
-        for n, (rel, pairs) in FILES.items():
+        for n, (rel, pairs, _mark) in FILES.items():
             path = base / rel
             if states[n] != "pristine":
                 print(f"{n}: already patched")
@@ -665,7 +691,7 @@ def main():
             print(f"{n}: patched")
         (base / "converters" / "dsml.py").write_text(DSML_SOURCE, encoding="utf-8")
         print("dsml: written")
-        for n, (rel, _) in FILES.items():
+        for n, (rel, _p, _m) in FILES.items():
             py_compile.compile(str(base / rel), doraise=True)
         py_compile.compile(str(base / "converters" / "dsml.py"), doraise=True)
     except Exception as exc:  # restore pristine files if anything failed
@@ -708,7 +734,7 @@ esac
 # ---------- offline tests ----------------------------------------------------
 section "Tests"
 
-info "Test 1/5: system messages inside messages[] are extracted (all system shapes)"
+info "Test 1/6: system messages inside messages[] are extracted (all system shapes)"
 "$VENV_PYTHON" - <<'PY'
 from a2o.converters.parser import parse_anthropic_request
 
@@ -733,7 +759,7 @@ assert "TOP" in s and "EXTRA" in s, s
 print("PASS")
 PY
 
-info "Test 2/5: DSML parser"
+info "Test 2/6: DSML parser"
 "$VENV_PYTHON" - <<'PY'
 import json
 from a2o.converters.dsml import parse_dsml_tool_calls, partial_start_len, find_dsml_start
@@ -752,7 +778,7 @@ assert partial_start_len("abc<" + P + "DS") == 4 and partial_start_len("abc") ==
 print("PASS")
 PY
 
-info "Test 3/5: non-streaming DSML -> Anthropic tool_use"
+info "Test 3/6: non-streaming DSML -> Anthropic tool_use"
 "$VENV_PYTHON" - <<'PY'
 from a2o.converters.response import convert_openai_to_anthropic
 P = "\uff5c"
@@ -770,7 +796,7 @@ assert r["stop_reason"] == "end_turn" and r["content"][0]["text"] == "hello"
 print("PASS")
 PY
 
-info "Test 4/5: request conversion never sends role=system upstream"
+info "Test 4/6: request conversion never sends role=system upstream"
 "$VENV_PYTHON" - <<'PY'
 from a2o.converters.parser import parse_anthropic_request
 from a2o.converters.request import convert_anthropic_to_openai
@@ -787,7 +813,7 @@ assert convert_anthropic_to_openai(req)["messages"] == [{"role": "user", "conten
 print("PASS")
 PY
 
-info "Test 5/5: streaming DSML -> tool_use (split across chunks)"
+info "Test 5/6: streaming DSML -> tool_use (split across chunks)"
 "$VENV_PYTHON" - <<'PY'
 import json
 from a2o.converters.streaming import convert_openai_stream_to_anthropic_sse
@@ -818,7 +844,27 @@ assert "".join(d["delta"]["text"] for d in d2 if d.get("delta", {}).get("type") 
 assert [d for d in d2 if d["type"] == "message_delta"][0]["delta"]["stop_reason"] == "end_turn"
 print("PASS")
 PY
-success "All 5 offline tests passed."
+info "Test 6/6: tool schemas lose lookahead patterns but keep everything else"
+"$VENV_PYTHON" - <<'PY'
+from a2o.converters.parser import parse_anthropic_request
+from a2o.converters.request import convert_anthropic_to_openai
+schema = {"type": "object", "properties": {
+    "bad":  {"type": "string", "pattern": "^(?!-)[a-z]+$"},
+    "good": {"type": "string", "pattern": "^[a-z]+$"},
+    "pattern": {"type": "string"},                       # a property NAMED pattern
+    "nested": {"anyOf": [{"type": "string", "pattern": "(?<=x)y"}, {"type": "integer"}]}}}
+req = parse_anthropic_request({"model": "t", "max_tokens": 50,
+    "tools": [{"name": "t1", "description": "d", "input_schema": schema}],
+    "messages": [{"role": "user", "content": "Hi"}]})
+props = convert_anthropic_to_openai(req)["tools"][0]["function"]["parameters"]["properties"]
+assert "pattern" not in props["bad"], props["bad"]
+assert props["good"]["pattern"] == "^[a-z]+$", props["good"]
+assert props["pattern"] == {"type": "string"}, props["pattern"]
+assert "pattern" not in props["nested"]["anyOf"][0], props["nested"]
+assert schema["properties"]["bad"]["pattern"] == "^(?!-)[a-z]+$"   # input not mutated
+print("PASS")
+PY
+success "All 6 offline tests passed."
 
 # ---------- save configuration -----------------------------------------------
 section "Saving configuration"
