@@ -8,7 +8,7 @@
 # What this script does
 #   1. Lets you pick Dahl or a custom OpenAI-compatible endpoint + model
 #   2. Installs a PINNED ant2oai (a2o) version into ~/ant2oia/.venv
-#   3. Applies six small compatibility patches to a2o (each one checked first):
+#   3. Applies six small compatibility patches to a2o (seven file edits; each one checked first):
 #        - parser.py   accept role="system" entries inside messages[]
 #        - request.py  fold the system prompt into the first user message
 #                      (for endpoints that reject role="system")
@@ -21,7 +21,9 @@
 #                      instead of "reasoning_content"), so it reaches Claude Code as
 #                      a "thinking" block instead of being silently dropped
 #   4. Runs offline tests, then (optionally) a live smoke test
-#   5. Writes config.env (600), a launcher, and your VS Code settings
+#   5. Writes config.env (600), a launcher, and your VS Code settings (comments in
+#      settings.json are tolerated, with your consent), and optionally the Claude Code
+#      thinking-display settings
 #
 # Safe to re-run. No sudo needed.
 # =============================================================================
@@ -32,10 +34,18 @@ set -Eeuo pipefail
 # ---------- configuration ----------------------------------------------------
 INSTALL_DIR="${INSTALL_DIR:-$HOME/ant2oia}"
 VENV_DIR="$INSTALL_DIR/.venv"
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*) VENV_BIN="$VENV_DIR/Scripts"; EXE=".exe" ;;
+    *)                    VENV_BIN="$VENV_DIR/bin";     EXE="" ;;
+esac
 CONFIG_FILE="$INSTALL_DIR/config.env"
-LAUNCHER="$INSTALL_DIR/start-dahl-claude.sh"
+LAUNCHER="$INSTALL_DIR/start-a2o.sh"
 PATCH_HELPER="$INSTALL_DIR/a2o_patch.py"
 LOG_FILE="$INSTALL_DIR/a2o.log"
+SETTINGS_HELPER="$INSTALL_DIR/a2o_settings.py"
+CLAUDE_SETTINGS="${CLAUDE_SETTINGS:-$HOME/.claude/settings.json}"
+DEFAULT_THINKING_TOKENS="16000"
+BACKUPS_KEEP=5                  # settings.json backups to keep per file
 
 # The patches were written and verified against this exact version.
 A2O_VERSION="${A2O_VERSION:-0.1.6}"
@@ -43,7 +53,7 @@ A2O_VERSION="${A2O_VERSION:-0.1.6}"
 A2O_HOST_DEFAULT="127.0.0.1"
 A2O_PORT_DEFAULT="3578"
 DEFAULT_BASE_URL="https://inference.dahl.global/v1/chat/completions"
-DEFAULT_MODEL="deepseek-ai/DeepSeek-V4-Flash-0731"
+DEFAULT_MODEL="zai-org/GLM-5.3-Flash"
 PLACEHOLDER_TOKEN="a2o-local"   # used when the endpoint needs no key
 
 TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
@@ -151,9 +161,9 @@ printf '\n'
 # ---------- requirements -----------------------------------------------------
 section "Checking requirements"
 
-command -v python3 >/dev/null 2>&1 || die "python3 is not installed."
+PYTHON="$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)"
+[[ -n "$PYTHON" ]] || die "python3 is not installed."
 command -v curl >/dev/null 2>&1 || die "curl is not installed."
-PYTHON="$(command -v python3)"
 "$PYTHON" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 9) else 1)' \
     || die "Python 3.9 or newer is required."
 "$PYTHON" -c 'import venv, ensurepip' >/dev/null 2>&1 \
@@ -170,14 +180,20 @@ success "Install directory: $INSTALL_DIR"
 section "Choose your OpenAI-compatible backend"
 
 SAVED_UPSTREAM=""; SAVED_MODEL=""; SAVED_HOST=""; SAVED_PORT=""; SAVED_KEY=""; SAVED_PROVIDER=""
+SAVED_THINKING=""; SAVED_THINKING_TOKENS=""
 if [[ -f "$CONFIG_FILE" ]]; then
-    # Read saved values in a subshell so they cannot clobber script variables.
-    SAVED_UPSTREAM="$( . "$CONFIG_FILE"; printf '%s' "${A2O_UPSTREAM:-}" )"
-    SAVED_MODEL="$( . "$CONFIG_FILE"; printf '%s' "${A2O_MODEL:-}" )"
-    SAVED_HOST="$( . "$CONFIG_FILE"; printf '%s' "${A2O_HOST:-}" )"
-    SAVED_PORT="$( . "$CONFIG_FILE"; printf '%s' "${A2O_PORT:-}" )"
-    SAVED_KEY="$( . "$CONFIG_FILE"; printf '%s' "${A2O_API_KEY:-}" )"
-    SAVED_PROVIDER="$( . "$CONFIG_FILE"; printf '%s' "${A2O_PROVIDER_NAME:-}" )"
+    # Read saved values once, in a subshell, so they cannot clobber script variables.
+    eval "$(
+        . "$CONFIG_FILE"
+        printf 'SAVED_UPSTREAM=%q\n'        "${A2O_UPSTREAM:-}"
+        printf 'SAVED_MODEL=%q\n'           "${A2O_MODEL:-}"
+        printf 'SAVED_HOST=%q\n'            "${A2O_HOST:-}"
+        printf 'SAVED_PORT=%q\n'            "${A2O_PORT:-}"
+        printf 'SAVED_KEY=%q\n'             "${A2O_API_KEY:-}"
+        printf 'SAVED_PROVIDER=%q\n'        "${A2O_PROVIDER_NAME:-}"
+        printf 'SAVED_THINKING=%q\n'        "${A2O_THINKING:-}"
+        printf 'SAVED_THINKING_TOKENS=%q\n' "${A2O_THINKING_TOKENS:-}"
+    )"
 fi
 
 printf '\n  1) Dahl Inference\n'
@@ -233,6 +249,7 @@ while true; do
         1) API_KEY="$(prompt_secret 'Enter API key (input hidden)')"
            if [[ -z "$API_KEY" ]]; then warn "Empty key."; continue; fi
            if [[ "$API_KEY" =~ [[:space:]] ]]; then warn "A key cannot contain spaces."; continue; fi
+           if [[ "$API_KEY" == *\"* || "$API_KEY" == *\\* ]]; then warn "A key cannot contain quotes or backslashes."; continue; fi
            break ;;
         2) API_KEY=""; break ;;
         3) if [[ -z "$SAVED_KEY" ]]; then warn "There is no saved key."; continue; fi
@@ -246,17 +263,45 @@ section "Local a2o settings"
 
 A2O_HOST="$(prompt_default 'Local a2o host' "${SAVED_HOST:-$A2O_HOST_DEFAULT}")"
 A2O_PORT="$(prompt_default 'Local a2o port' "${SAVED_PORT:-$A2O_PORT_DEFAULT}")"
-if [[ ! "$A2O_PORT" =~ ^[0-9]+$ ]] || (( A2O_PORT < 1 || A2O_PORT > 65535 )); then
+if [[ ! "$A2O_PORT" =~ ^[0-9]{1,5}$ ]] || (( 10#$A2O_PORT < 1 || 10#$A2O_PORT > 65535 )); then
     die "Invalid port: $A2O_PORT"
+fi
+A2O_PORT=$(( 10#$A2O_PORT ))   # normalise "08" -> 8 (bash would read it as bad octal)
+if [[ -z "$A2O_HOST" || "$A2O_HOST" =~ [[:space:]] ]]; then
+    die "Invalid host: '$A2O_HOST'"
 fi
 A2O_DEBUG="0"
 if confirm "Enable a2o --debug logging? (logs may contain your prompts)" N; then A2O_DEBUG="1"; fi
 
-port_busy() { "$PYTHON" -c 'import socket,sys; s=socket.socket(); s.settimeout(1)
-try: s.connect(("127.0.0.1", int(sys.argv[1]))); sys.exit(0)
-except OSError: sys.exit(1)' "$1" >/dev/null 2>&1; }
+# ---------- thinking display -------------------------------------------------
+section "Thinking display (Claude Code)"
+printf '%s\n' 'a2o passes the model reasoning to Claude Code as "thinking" blocks. To actually see'
+printf '%s\n' 'them, Claude Code needs alwaysThinkingEnabled + showThinkingSummaries (in'
+printf '%s\n' "$CLAUDE_SETTINGS) and MAX_THINKING_TOKENS (in VS Code settings.json)."
+THINKING="0"; THINKING_TOKENS=""
+THINK_DEFAULT="Y"
+if [[ "$SAVED_THINKING" == "0" ]]; then THINK_DEFAULT="N"; fi
+if confirm "Configure these automatically? (backups are kept)" "$THINK_DEFAULT"; then
+    THINKING="1"
+    while true; do
+        THINKING_TOKENS="$(prompt_default 'MAX_THINKING_TOKENS' "${SAVED_THINKING_TOKENS:-$DEFAULT_THINKING_TOKENS}")"
+        if [[ "$THINKING_TOKENS" =~ ^[0-9]{1,7}$ ]] && (( 10#$THINKING_TOKENS > 0 )); then
+            THINKING_TOKENS=$(( 10#$THINKING_TOKENS )); break
+        fi
+        warn "Enter a positive whole number."
+    done
+fi
 
-if port_busy "$A2O_PORT"; then
+port_busy() {   # port_busy HOST PORT  -> 0 if something is listening
+    "$PYTHON" -c 'import socket,sys
+h = sys.argv[1]
+if h in ("0.0.0.0", "", "::"): h = "127.0.0.1"
+s = socket.socket(); s.settimeout(1)
+try: s.connect((h, int(sys.argv[2]))); sys.exit(0)
+except OSError: sys.exit(1)' "$1" "$2" >/dev/null 2>&1
+}
+
+if port_busy "$A2O_HOST" "$A2O_PORT"; then
     warn "Something is already listening on port $A2O_PORT (an older a2o launcher?)."
     warn "Stop it before starting the new proxy. Setup can still continue."
 fi
@@ -291,6 +336,7 @@ printf '%-20s %s\n' "Upstream URL:" "$BASE_URL"
 printf '%-20s %s\n' "Model:" "$MODEL"
 printf '%-20s %s\n' "Local endpoint:" "http://$A2O_HOST:$A2O_PORT"
 printf '%-20s %s\n' "API key:" "$([[ -n "$API_KEY" ]] && printf 'configured' || printf 'none')"
+printf '%-20s %s\n' "Thinking display:" "$([[ "$THINKING" == "1" ]] && printf 'yes (MAX_THINKING_TOKENS=%s)' "$THINKING_TOKENS" || printf 'not configured')"
 printf '%-20s %s\n' "a2o version:" "$A2O_VERSION (pinned)"
 printf '%-20s %s\n' "Install directory:" "$INSTALL_DIR"
 printf '%-20s %s\n' "VS Code settings:" "$VSCODE_SETTINGS"
@@ -300,7 +346,7 @@ confirm "Continue with this configuration?" Y || { printf 'Setup cancelled.\n'; 
 # ---------- venv + install ---------------------------------------------------
 section "Python environment"
 
-if [[ ! -x "$VENV_DIR/bin/python" ]]; then
+if [[ ! -x "$VENV_BIN/python$EXE" ]]; then
     info "Creating virtual environment..."
     "$PYTHON" -m venv "$VENV_DIR"
     success "Virtual environment created."
@@ -308,7 +354,7 @@ else
     success "Existing virtual environment found."
 fi
 # Use the venv's interpreter explicitly; no need to 'source activate'.
-VENV_PYTHON="$VENV_DIR/bin/python"
+VENV_PYTHON="$VENV_BIN/python$EXE"
 
 installed_version() { "$VENV_PYTHON" -m pip show ant2oai 2>/dev/null | sed -n 's/^Version: //p'; }
 
@@ -330,7 +376,7 @@ cat > "$PATCH_HELPER" <<'PYEOF'
 """Check/apply the small a2o compatibility patches.  usage: a2o_patch.py status|apply
 
 Each file is classified as:  patched | pristine | unknown
-Only 'pristine' files are modified, and a one-time pristine copy is kept as <file>.orig
+Only 'pristine' files are modified, and a pristine copy is kept as <file>.orig
 """
 import importlib.util
 import py_compile
@@ -340,6 +386,9 @@ from pathlib import Path
 
 MARK = "A2O-DSML-PATCH"
 SCHEMA_MARK = "A2O-SCHEMA-PATCH"
+# Bump this whenever the streaming patch changes: a file patched by an older script no longer
+# carries it, so it is reported as "unknown" and the script offers a clean reinstall + re-patch.
+STREAM_MARK = "A2O-DSML-PATCH-v2"
 
 
 def pkg_dir():
@@ -490,6 +539,13 @@ STREAM_METHODS = '''    # A2O-DSML-PATCH: text is streamed live, but anything th
         if not calls:
             self._emit_text_raw(events, buf)
             return
+        if _rest and _rest.strip():
+            # A2O-DSML-PATCH-v2: text after the tool-call block cannot be placed safely after tool_use
+            # blocks in the stream, so it is dropped; leave a trace instead of doing it silently.
+            import logging
+            logging.getLogger("a2o").warning(
+                "A2O-DSML-PATCH: dropped %d chars of text that followed a DSML tool call", len(_rest.strip())
+            )
         base = 1000 + len(self._tool_calls)
         for i, call in enumerate(calls):
             tc = dict(call)
@@ -577,7 +633,7 @@ FILES = {
     "request": ("converters/request.py", REQUEST, MARK),
     "schema": ("converters/request.py", SCHEMA, SCHEMA_MARK),
     "response": ("converters/response.py", RESPONSE, MARK),
-    "streaming": ("converters/streaming.py", STREAMING, MARK),
+    "streaming": ("converters/streaming.py", STREAMING, STREAM_MARK),
     "stream_reasoning": ("converters/streaming.py", STREAM_REASONING, 'delta.get("reasoning")'),
     "response_reasoning": ("converters/response.py", RESPONSE_REASONING, 'message.get("reasoning")'),
 }
@@ -619,21 +675,8 @@ def partial_start_len(text: str) -> int:
     return 0
 
 
-def parse_dsml_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
-    """Return (remaining_text, OpenAI-style tool_calls). Incomplete blocks are left as text."""
-    if not text:
-        return text, []
-    start = find_dsml_start(text)
-    if start < 0:
-        return text, []
-    end_m = _END_RE.search(text, start)
-    if end_m is None:
-        return text, []
-
-    block = text[start:end_m.end()]
-    remaining = (text[:start] + text[end_m.end():]).strip()
+def _parse_block(block: str) -> list[dict[str, Any]]:
     calls: list[dict[str, Any]] = []
-
     for inv in _INVOKE_RE.finditer(block):
         name, body = inv.group(1), inv.group(2)
         args: dict[str, Any] = {}
@@ -657,9 +700,31 @@ def parse_dsml_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
                 },
             }
         )
+    return calls
+
+
+def parse_dsml_tool_calls(text: str) -> tuple[str, list[dict[str, Any]]]:
+    """Return (remaining_text, OpenAI-style tool_calls). Handles several blocks in one
+    message. Incomplete or unparseable blocks are left as text."""
+    if not text:
+        return text, []
+    remaining = text
+    calls: list[dict[str, Any]] = []
+    while True:
+        start = find_dsml_start(remaining)
+        if start < 0:
+            break
+        end_m = _END_RE.search(remaining, start)
+        if end_m is None:
+            break
+        found = _parse_block(remaining[start:end_m.end()])
+        if not found:
+            break
+        calls.extend(found)
+        remaining = remaining[:start] + remaining[end_m.end():]
     if not calls:
         return text, []
-    return remaining, calls
+    return remaining.strip(), calls
 '''
 
 
@@ -690,35 +755,50 @@ def main():
         print("UNKNOWN: " + ", ".join(unknown))
         return 3
 
-    touched = []
+    # Snapshot everything we may touch, so a failure restores the exact pre-run state
+    # (not just the pristine copy, which would also throw away earlier patches).
+    snapshots = {}
+    for rel in {rel for rel, _p, _m in FILES.values()}:
+        snapshots[base / rel] = (base / rel).read_text(encoding="utf-8")
+    dsml_path = base / "converters" / "dsml.py"
+    dsml_before = dsml_path.read_text(encoding="utf-8") if dsml_path.exists() else None
+
+    # Refresh the *.orig copy only for files that are completely pristine right now, so a
+    # stale copy from another a2o version can never be restored over a newer file.
+    by_file = {}
+    for n, (rel, _p, _m) in FILES.items():
+        by_file.setdefault(rel, []).append(n)
+    for rel, names in by_file.items():
+        if all(states[n] == "pristine" for n in names):
+            path = base / rel
+            shutil.copy2(path, path.with_name(path.name + ".orig"))
+
     try:
         for n, (rel, pairs, _mark) in FILES.items():
             path = base / rel
             if states[n] != "pristine":
                 print(f"{n}: already patched")
                 continue
-            orig = path.with_name(path.name + ".orig")
-            if not orig.exists():
-                shutil.copy2(path, orig)
             text = path.read_text(encoding="utf-8")
             for old, new in pairs:
                 if text.count(old) != 1:
                     raise RuntimeError(f"{n}: expected block found {text.count(old)} times")
                 text = text.replace(old, new, 1)
             path.write_text(text, encoding="utf-8")
-            touched.append(path)
             print(f"{n}: patched")
-        (base / "converters" / "dsml.py").write_text(DSML_SOURCE, encoding="utf-8")
+        dsml_path.write_text(DSML_SOURCE, encoding="utf-8")
         print("dsml: written")
         for n, (rel, _p, _m) in FILES.items():
             py_compile.compile(str(base / rel), doraise=True)
-        py_compile.compile(str(base / "converters" / "dsml.py"), doraise=True)
-    except Exception as exc:  # restore pristine files if anything failed
-        for path in touched:
-            orig = path.with_name(path.name + ".orig")
-            if orig.exists():
-                shutil.copy2(orig, path)
-        print(f"FAILED: {exc} (pristine files restored)")
+        py_compile.compile(str(dsml_path), doraise=True)
+    except Exception as exc:  # put every file back exactly as it was before this run
+        for path, text in snapshots.items():
+            path.write_text(text, encoding="utf-8")
+        if dsml_before is None:
+            dsml_path.unlink(missing_ok=True)
+        else:
+            dsml_path.write_text(dsml_before, encoding="utf-8")
+        print(f"FAILED: {exc} (files restored to their state before this run)")
         return 4
     return 0
 
@@ -726,6 +806,192 @@ def main():
 sys.exit(main())
 PYEOF
 chmod 600 "$PATCH_HELPER"
+
+# Settings helper: merges a2o/Claude Code settings into JSON files (tolerates comments, keeps the
+# token out of argv). Written here so the offline tests can exercise it too.
+cat > "$SETTINGS_HELPER" <<'SETPY'
+#!/usr/bin/env python3
+"""Merge a2o / Claude Code settings into JSON settings files.
+
+usage:
+  a2o_settings.py vscode SETTINGS_JSON BASE_URL MODEL [THINKING_TOKENS] [--allow-jsonc]
+  a2o_settings.py claude SETTINGS_JSON [--allow-jsonc]
+
+The API token is read from the A2O_SETTINGS_TOKEN environment variable (never from argv,
+so it does not show up in `ps`).
+
+Exit codes: 0 ok | 3 cannot edit safely (file left untouched)
+            4 file has comments / trailing commas and --allow-jsonc was not given
+"""
+import json
+import os
+import sys
+import tempfile
+from pathlib import Path
+
+
+def _strip_comments(text):
+    out, i, n, in_str = [], 0, len(text), False
+    while i < n:
+        c = text[i]
+        if in_str:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+            i += 1
+            continue
+        if c == '"':
+            in_str = True
+            out.append(c)
+            i += 1
+        elif c == "/" and text.startswith("//", i):
+            while i < n and text[i] != "\n":
+                i += 1
+        elif c == "/" and text.startswith("/*", i):
+            end = text.find("*/", i + 2)
+            i = n if end < 0 else end + 2
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def _strip_trailing_commas(text):
+    out, i, n, in_str = [], 0, len(text), False
+    while i < n:
+        c = text[i]
+        if in_str:
+            out.append(c)
+            if c == "\\" and i + 1 < n:
+                out.append(text[i + 1])
+                i += 2
+                continue
+            if c == '"':
+                in_str = False
+            i += 1
+            continue
+        if c == '"':
+            in_str = True
+        elif c == ",":
+            j = i + 1
+            while j < n and text[j] in " \t\r\n":
+                j += 1
+            if j < n and text[j] in "}]":
+                i += 1
+                continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+
+def strip_jsonc(text):
+    return _strip_trailing_commas(_strip_comments(text))
+
+
+def load(path, allow_jsonc):
+    """Return (settings_dict, had_jsonc_features)."""
+    text = path.read_text(encoding="utf-8-sig") if path.exists() else ""
+    if not text.strip():
+        return {}, False
+    try:
+        data, jsonc = json.loads(text), False
+    except json.JSONDecodeError:
+        try:
+            data, jsonc = json.loads(strip_jsonc(text)), True
+        except json.JSONDecodeError as exc:
+            print("%s is not valid JSON, even ignoring comments: %s" % (path, exc))
+            sys.exit(3)
+        if not allow_jsonc:
+            print("%s has comments or trailing commas; editing it would drop the comments" % path)
+            sys.exit(4)
+    if not isinstance(data, dict):
+        print("%s must contain a JSON object" % path)
+        sys.exit(3)
+    return data, jsonc
+
+
+def save(path, settings):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = tempfile.NamedTemporaryFile("w", delete=False, dir=str(path.parent), encoding="utf-8")
+    try:
+        json.dump(settings, tmp, indent=2, ensure_ascii=False)
+        tmp.write("\n")
+        tmp.close()
+        os.chmod(tmp.name, 0o600)  # the file holds an API key
+        os.replace(tmp.name, path)
+    except BaseException:
+        tmp.close()
+        if os.path.exists(tmp.name):
+            os.unlink(tmp.name)
+        raise
+
+
+def cmd_vscode(path, base_url, model, think_tokens, allow_jsonc):
+    token = os.environ.get("A2O_SETTINGS_TOKEN", "")
+    if not token:
+        print("A2O_SETTINGS_TOKEN is not set")
+        sys.exit(3)
+    settings, jsonc = load(path, allow_jsonc)
+    key = "claudeCode.environmentVariables"
+    existing = settings.get(key, [])
+    if not isinstance(existing, list):
+        print("%s exists but is not an array; refusing to overwrite it" % key)
+        sys.exit(3)
+
+    managed = {"ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL"}
+    if think_tokens:
+        managed.add("MAX_THINKING_TOKENS")
+    removed = [e["name"] for e in existing if isinstance(e, dict) and e.get("name") in managed]
+    kept = [e for e in existing if not (isinstance(e, dict) and e.get("name") in managed)]
+    kept += [
+        {"name": "ANTHROPIC_BASE_URL", "value": base_url},
+        {"name": "ANTHROPIC_AUTH_TOKEN", "value": token},  # a2o forwards Authorization: Bearer <this>
+        {"name": "ANTHROPIC_MODEL", "value": model},
+    ]
+    if think_tokens:
+        kept.append({"name": "MAX_THINKING_TOKENS", "value": str(think_tokens)})
+    settings[key] = kept
+    if "claudeCode.selectedModel" in settings:
+        print("NOTE: claudeCode.selectedModel is set and may override ANTHROPIC_MODEL; consider removing it")
+    save(path, settings)
+    if jsonc:
+        print("NOTE: comments / trailing commas were dropped (your backup keeps them)")
+    if removed:
+        print("Replaced existing entries: " + ", ".join(removed))
+    print("OK")
+
+
+def cmd_claude(path, allow_jsonc):
+    settings, jsonc = load(path, allow_jsonc)
+    settings["alwaysThinkingEnabled"] = True
+    settings["showThinkingSummaries"] = True
+    save(path, settings)
+    if jsonc:
+        print("NOTE: comments / trailing commas were dropped (your backup keeps them)")
+    print("OK")
+
+
+def main(argv):
+    allow = "--allow-jsonc" in argv
+    args = [a for a in argv[1:] if a != "--allow-jsonc"]
+    if len(args) >= 4 and args[0] == "vscode":
+        tokens = args[4] if len(args) > 4 else ""
+        cmd_vscode(Path(args[1]), args[2], args[3], tokens, allow)
+    elif len(args) == 2 and args[0] == "claude":
+        cmd_claude(Path(args[1]), allow)
+    else:
+        sys.exit(__doc__)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))
+SETPY
+chmod 600 "$SETTINGS_HELPER"
 
 info "Checking which a2o files are already patched..."
 PATCH_STATUS="$("$VENV_PYTHON" "$PATCH_HELPER" status)"
@@ -747,13 +1013,13 @@ PATCH_RC=0
 case "$PATCH_RC" in
     0) success "All patches are in place." ;;
     3) die "a2o files still look different from version $A2O_VERSION. Try: A2O_VERSION=<other> or reinstall." ;;
-    *) die "Patching failed; pristine files were restored. See the message above." ;;
+    *) die "Patching failed; files were restored to how they were before this run. See the message above." ;;
 esac
 
 # ---------- offline tests ----------------------------------------------------
 section "Tests"
 
-info "Test 1/8: system messages inside messages[] are extracted (all system shapes)"
+info "Test 1/10: system messages inside messages[] are extracted (all system shapes)"
 "$VENV_PYTHON" - <<'PY'
 from a2o.converters.parser import parse_anthropic_request
 
@@ -778,7 +1044,7 @@ assert "TOP" in s and "EXTRA" in s, s
 print("PASS")
 PY
 
-info "Test 2/8: DSML parser"
+info "Test 2/10: DSML parser"
 "$VENV_PYTHON" - <<'PY'
 import json
 from a2o.converters.dsml import parse_dsml_tool_calls, partial_start_len, find_dsml_start
@@ -793,11 +1059,13 @@ a = json.loads(calls[0]["function"]["arguments"])
 assert calls[0]["function"]["name"] == "read_file" and a == {"file_path": "/tmp/test.txt", "offset": 3}, a
 assert parse_dsml_tool_calls(s[:-10])[1] == []            # incomplete block stays text
 assert parse_dsml_tool_calls("plain")[1] == []
+t2, c2 = parse_dsml_tool_calls("A\n" + s + "\nmid\n" + s)       # several blocks in one message
+assert len(c2) == 2 and t2.startswith("A") and "DSML" not in t2, (t2, c2)
 assert partial_start_len("abc<" + P + "DS") == 4 and partial_start_len("abc") == 0
 print("PASS")
 PY
 
-info "Test 3/8: non-streaming DSML -> Anthropic tool_use"
+info "Test 3/10: non-streaming DSML -> Anthropic tool_use"
 "$VENV_PYTHON" - <<'PY'
 from a2o.converters.response import convert_openai_to_anthropic
 P = "\uff5c"
@@ -815,7 +1083,7 @@ assert r["stop_reason"] == "end_turn" and r["content"][0]["text"] == "hello"
 print("PASS")
 PY
 
-info "Test 4/8: request conversion never sends role=system upstream"
+info "Test 4/10: request conversion never sends role=system upstream"
 "$VENV_PYTHON" - <<'PY'
 from a2o.converters.parser import parse_anthropic_request
 from a2o.converters.request import convert_anthropic_to_openai
@@ -832,10 +1100,15 @@ assert convert_anthropic_to_openai(req)["messages"] == [{"role": "user", "conten
 print("PASS")
 PY
 
-info "Test 5/8: streaming DSML -> tool_use (split across chunks)"
+info "Test 5/10: streaming DSML -> tool_use (split across chunks)"
 "$VENV_PYTHON" - <<'PY'
 import json
+import logging
 from a2o.converters.streaming import convert_openai_stream_to_anthropic_sse
+logged = []
+class _Capture(logging.Handler):
+    def emit(self, record): logged.append(record.getMessage())
+logging.getLogger("a2o").addHandler(_Capture())
 P = "\uff5c"
 dsml = (f"<{P}DSML{P}tool_calls><{P}DSML{P}invoke name=\"read_file\">"
         f"<{P}DSML{P}parameter name=\"file_path\" string=\"true\">/tmp/x</{P}DSML{P}parameter>"
@@ -855,6 +1128,14 @@ args = "".join(d["delta"]["partial_json"] for d in datas if d.get("delta", {}).g
 assert json.loads(args) == {"file_path": "/tmp/x"}, args
 assert [d for d in datas if d["type"] == "message_delta"][0]["delta"]["stop_reason"] == "tool_use"
 assert datas[-1]["type"] == "message_stop"
+# text AFTER the block is dropped (with a log line) but must not break the stream
+full2 = "Reading it now. " + dsml + " trailing words"
+ch2 = [{"model": "m", "choices": [{"index": 0, "delta": {"content": full2[i:i + 7]}, "finish_reason": None}]} for i in range(0, len(full2), 7)]
+ch2.append({"model": "m", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+d3 = [json.loads(e.split("data: ", 1)[1]) for e in convert_openai_stream_to_anthropic_sse(ch2, "m")]
+assert any(d["type"] == "content_block_start" and d["content_block"]["type"] == "tool_use" for d in d3)
+assert "DSML" not in "".join(d["delta"]["text"] for d in d3 if d.get("delta", {}).get("type") == "text_delta")
+assert any("dropped" in m for m in logged), logged          # ...and it says so in the log
 # plain streaming text must be unaffected
 plain = [{"model": "m", "choices": [{"index": 0, "delta": {"content": c}, "finish_reason": None}]} for c in ["Hel", "lo <", "b>ok"]]
 plain.append({"model": "m", "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
@@ -863,7 +1144,7 @@ assert "".join(d["delta"]["text"] for d in d2 if d.get("delta", {}).get("type") 
 assert [d for d in d2 if d["type"] == "message_delta"][0]["delta"]["stop_reason"] == "end_turn"
 print("PASS")
 PY
-info "Test 6/8: tool schemas lose lookahead patterns but keep everything else"
+info "Test 6/10: tool schemas lose lookahead patterns but keep everything else"
 "$VENV_PYTHON" - <<'PY'
 from a2o.converters.parser import parse_anthropic_request
 from a2o.converters.request import convert_anthropic_to_openai
@@ -883,7 +1164,7 @@ assert "pattern" not in props["nested"]["anyOf"][0], props["nested"]
 assert schema["properties"]["bad"]["pattern"] == "^(?!-)[a-z]+$"   # input not mutated
 print("PASS")
 PY
-info "Test 7/8: streaming reasoning (field name 'reasoning') -> thinking block, then text"
+info "Test 7/10: streaming reasoning (field name 'reasoning') -> thinking block, then text"
 "$VENV_PYTHON" - <<'PY'
 import json
 from a2o.converters.streaming import convert_openai_stream_to_anthropic_sse
@@ -911,7 +1192,7 @@ for field in ("reasoning", "reasoning_content"):          # new name AND the ori
 print("PASS")
 PY
 
-info "Test 8/8: non-streaming reasoning (field name 'reasoning') -> thinking block"
+info "Test 8/10: non-streaming reasoning (field name 'reasoning') -> thinking block"
 "$VENV_PYTHON" - <<'PY'
 from a2o.converters.response import convert_openai_to_anthropic
 
@@ -929,7 +1210,73 @@ r = conv({"content": "hello"})                                     # no reasonin
 assert [b["type"] for b in r["content"]] == ["text"], r["content"]
 print("PASS")
 PY
-success "All 8 offline tests passed."
+info "Test 9/10: a follow-up turn with a thinking block in history converts cleanly"
+"$VENV_PYTHON" - <<'PY'
+import json
+from a2o.converters.parser import parse_anthropic_request
+from a2o.converters.request import convert_anthropic_to_openai
+req = parse_anthropic_request({"model": "t", "max_tokens": 50, "messages": [
+    {"role": "user", "content": "What is 17*23?"},
+    {"role": "assistant", "content": [
+        {"type": "thinking", "thinking": "SECRET-REASONING", "signature": "sig"},
+        {"type": "text", "text": "391"}]},
+    {"role": "user", "content": "Now double it."}]})
+msgs = convert_anthropic_to_openai(req)["messages"]
+asst = [m for m in msgs if m["role"] == "assistant"][0]
+assert asst["content"] == "391", asst                      # reasoning must not leak into visible text
+assert '"type": "thinking"' not in json.dumps(msgs), msgs   # no Anthropic-only block types upstream
+extra = sorted(set(asst) - {"role", "content"})
+print("PASS" + (" (note: assistant history also carries %s upstream; the live smoke test checks your provider accepts that)" % extra if extra else ""))
+PY
+
+info "Test 10/10: settings helper (comments, idempotent, token via env, strings left intact)"
+"$VENV_PYTHON" - "$SETTINGS_HELPER" <<'PY'
+import json, os, subprocess, sys, tempfile
+helper = sys.argv[1]
+d = tempfile.mkdtemp()
+URL = "http://127.0.0.1:3578"
+
+def run(*args, token="sekret-token"):
+    env = dict(os.environ)
+    env.pop("A2O_SETTINGS_TOKEN", None)
+    if token:
+        env["A2O_SETTINGS_TOKEN"] = token
+    r = subprocess.run([sys.executable, helper, *args], env=env, capture_output=True, text=True)
+    return r.returncode, r.stdout + r.stderr
+
+vs = os.path.join(d, "settings.json")
+open(vs, "w").write('{\n  // my editor\n  "editor.fontSize": 14, /* inline */\n  "claudeCode.environmentVariables": [\n'
+                    '    {"name": "KEEP_ME", "value": "1"},\n    {"name": "ANTHROPIC_MODEL", "value": "old"},\n  ],\n}\n')
+rc, out = run("vscode", vs, URL, "m1", "16000")
+assert rc == 4, (rc, out)                                   # comments: needs consent
+assert "// my editor" in open(vs).read()                    # ...and the file is untouched without it
+assert "sekret-token" not in out
+rc, out = run("vscode", vs, URL, "m1", "16000", "--allow-jsonc")
+assert rc == 0, (rc, out)
+cfg = json.load(open(vs))
+env = {e["name"]: e["value"] for e in cfg["claudeCode.environmentVariables"]}
+assert env["KEEP_ME"] == "1" and env["ANTHROPIC_MODEL"] == "m1" and env["MAX_THINKING_TOKENS"] == "16000", env
+assert env["ANTHROPIC_AUTH_TOKEN"] == "sekret-token" and env["ANTHROPIC_BASE_URL"] == URL, env
+assert cfg["editor.fontSize"] == 14
+rc, out = run("vscode", vs, URL, "m2")                     # re-run: no duplicates, thinking entry left alone
+assert rc == 0, (rc, out)
+names = [e["name"] for e in json.load(open(vs))["claudeCode.environmentVariables"]]
+assert len(names) == len(set(names)) and "MAX_THINKING_TOKENS" in names, names
+assert run("vscode", vs, URL, "m2", token=None)[0] == 3     # token is mandatory
+if os.name == "posix":
+    assert (os.stat(vs).st_mode & 0o777) == 0o600           # the file holds a key
+cl = os.path.join(d, "claude.json")
+open(cl, "w").write('{"url": "http://x//y", "t": "a,]", // c\n "k": 1,}\n')   # // and ,] inside strings
+rc, out = run("claude", cl, "--allow-jsonc")
+c = json.load(open(cl))
+assert rc == 0 and c["url"] == "http://x//y" and c["t"] == "a,]" and c["k"] == 1, (rc, out, c)
+assert c["alwaysThinkingEnabled"] is True and c["showThinkingSummaries"] is True
+bad = os.path.join(d, "bad.json")
+open(bad, "w").write("{ nope")
+assert run("claude", bad, "--allow-jsonc")[0] == 3 and open(bad).read() == "{ nope"
+print("PASS")
+PY
+success "All 10 offline tests passed."
 
 # ---------- save configuration -----------------------------------------------
 section "Saving configuration"
@@ -944,6 +1291,8 @@ A2O_HOST=$(printf '%q' "$A2O_HOST")
 A2O_PORT=$(printf '%q' "$A2O_PORT")
 A2O_API_KEY=$(printf '%q' "$API_KEY")
 A2O_DEBUG=$(printf '%q' "$A2O_DEBUG")
+A2O_THINKING=$(printf '%q' "$THINKING")
+A2O_THINKING_TOKENS=$(printf '%q' "$THINKING_TOKENS")
 EOF
 )
 chmod 600 "$CONFIG_FILE"
@@ -954,12 +1303,13 @@ section "Creating launcher"
 
 cat > "$LAUNCHER" <<'EOF'
 #!/usr/bin/env bash
-# Starts the local a2o proxy using ~/ant2oia/config.env.   Usage: start-dahl-claude.sh
+# Starts the local a2o proxy using ~/ant2oia/config.env.   Usage: start-a2o.sh
 set -Eeuo pipefail
 
 INSTALL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CONFIG_FILE="$INSTALL_DIR/config.env"
 A2O_BIN="$INSTALL_DIR/.venv/bin/a2o"
+[[ -x "$A2O_BIN" ]] || A2O_BIN="$INSTALL_DIR/.venv/Scripts/a2o.exe"   # Windows (Git Bash)
 
 [[ -f "$CONFIG_FILE" ]] || { echo "[ERROR] Missing $CONFIG_FILE"; exit 1; }
 [[ -x "$A2O_BIN" ]] || { echo "[ERROR] a2o not found: $A2O_BIN"; exit 1; }
@@ -994,68 +1344,55 @@ success "Launcher: $LAUNCHER"
 section "Configuring VS Code Claude Code"
 
 TOKEN_VALUE="${API_KEY:-$PLACEHOLDER_TOKEN}"
-mkdir -p "$(dirname "$VSCODE_SETTINGS")"
+
+backup_file() {   # backup_file FILE : copy to FILE.bak.<timestamp> (mode 600), keep the newest N
+    local f="$1" bak="$1.bak.$TIMESTAMP" old=""
+    [[ -f "$f" ]] || return 0
+    cp "$f" "$bak"
+    chmod 600 "$bak"
+    old="$(ls -1t "$f".bak.* 2>/dev/null | tail -n +$(( BACKUPS_KEEP + 1 )) || true)"
+    if [[ -n "$old" ]]; then
+        printf '%s\n' "$old" | while IFS= read -r b; do rm -f -- "$b"; done
+    fi
+    success "Backed up $f -> $(basename "$bak") (keeping the newest $BACKUPS_KEEP)"
+}
+
+SETTINGS_OUT=""
+run_settings_helper() {   # run_settings_helper LABEL ARGS... ; output in $SETTINGS_OUT, returns helper's code
+    local label="$1" rc=0; shift
+    SETTINGS_OUT="$(A2O_SETTINGS_TOKEN="$TOKEN_VALUE" "$VENV_PYTHON" "$SETTINGS_HELPER" "$@" 2>&1)" || rc=$?
+    if [[ "$rc" -eq 4 ]]; then
+        warn "$label has comments or trailing commas. Editing it automatically drops them (the backup keeps them)."
+        if confirm "Edit it anyway?" N; then
+            rc=0
+            SETTINGS_OUT="$(A2O_SETTINGS_TOKEN="$TOKEN_VALUE" "$VENV_PYTHON" "$SETTINGS_HELPER" "$@" --allow-jsonc 2>&1)" || rc=$?
+        fi
+    fi
+    return "$rc"
+}
 
 print_manual_snippet() {
+    local snippet_token="$PLACEHOLDER_TOKEN" think_line=""
+    if [[ -n "$API_KEY" ]]; then snippet_token="<your API key>"; fi
+    if [[ "$THINKING" == "1" ]]; then
+        think_line=",
+    { \"name\": \"MAX_THINKING_TOKENS\", \"value\": \"$THINKING_TOKENS\" }"
+    fi
     warn "Add this to your VS Code user settings.json by hand:"
     cat <<EOF
 
 "claudeCode.environmentVariables": [
     { "name": "ANTHROPIC_BASE_URL", "value": "http://$A2O_HOST:$A2O_PORT" },
-    { "name": "ANTHROPIC_AUTH_TOKEN", "value": "${API_KEY:+<your API key>}${API_KEY:-$PLACEHOLDER_TOKEN}" },
-    { "name": "ANTHROPIC_MODEL", "value": "$MODEL" }
+    { "name": "ANTHROPIC_AUTH_TOKEN", "value": "$snippet_token" },
+    { "name": "ANTHROPIC_MODEL", "value": "$MODEL" }$think_line
 ]
 
 EOF
 }
 
-if [[ -f "$VSCODE_SETTINGS" ]]; then
-    cp "$VSCODE_SETTINGS" "$VSCODE_SETTINGS.bak.$TIMESTAMP"
-    success "Backed up existing settings.json -> settings.json.bak.$TIMESTAMP"
-fi
-
-SETTINGS_RC=0
-SETTINGS_OUT="$("$VENV_PYTHON" - "$VSCODE_SETTINGS" "http://$A2O_HOST:$A2O_PORT" "$TOKEN_VALUE" "$MODEL" <<'PY' 2>&1
-import json, os, sys, tempfile
-from pathlib import Path
-
-path = Path(sys.argv[1]); base_url, token, model = sys.argv[2:5]
-try:
-    text = path.read_text(encoding="utf-8-sig") if path.exists() else ""
-    settings = json.loads(text) if text.strip() else {}
-except json.JSONDecodeError as exc:
-    print("settings.json is not strict JSON (comments or trailing commas?): %s" % exc)
-    sys.exit(3)
-if not isinstance(settings, dict):
-    print("settings.json must contain a JSON object"); sys.exit(3)
-
-key = "claudeCode.environmentVariables"
-existing = settings.get(key, [])
-if not isinstance(existing, list):
-    print("%s exists but is not an array; refusing to overwrite it" % key); sys.exit(3)
-
-managed = {"ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_MODEL"}
-removed = [e["name"] for e in existing if isinstance(e, dict) and e.get("name") in managed]
-kept = [e for e in existing if not (isinstance(e, dict) and e.get("name") in managed)]
-kept += [
-    {"name": "ANTHROPIC_BASE_URL", "value": base_url},
-    {"name": "ANTHROPIC_AUTH_TOKEN", "value": token},   # a2o forwards Authorization: Bearer <this>
-    {"name": "ANTHROPIC_MODEL", "value": model},
-]
-settings[key] = kept
-if "claudeCode.selectedModel" in settings:
-    print("NOTE: claudeCode.selectedModel is set and may override ANTHROPIC_MODEL; consider removing it")
-
-tmp = tempfile.NamedTemporaryFile("w", delete=False, dir=str(path.parent), encoding="utf-8")
-json.dump(settings, tmp, indent=2, ensure_ascii=False); tmp.write("\n"); tmp.close()
-os.replace(tmp.name, path)
-if removed:
-    print("Replaced existing entries: " + ", ".join(removed))
-print("OK")
-PY
-)" || SETTINGS_RC=$?
-
-if [[ "$SETTINGS_RC" -eq 0 ]]; then
+mkdir -p "$(dirname "$VSCODE_SETTINGS")"
+backup_file "$VSCODE_SETTINGS"
+if run_settings_helper "VS Code settings.json" vscode "$VSCODE_SETTINGS" "http://$A2O_HOST:$A2O_PORT" "$MODEL" "${THINKING_TOKENS:-}"; then
     printf '%s\n' "$SETTINGS_OUT" | sed 's/^/  /'
     success "Claude Code environment variables configured."
 else
@@ -1064,16 +1401,143 @@ else
     print_manual_snippet
 fi
 
+if [[ "$THINKING" == "1" ]]; then
+    mkdir -p "$(dirname "$CLAUDE_SETTINGS")"
+    backup_file "$CLAUDE_SETTINGS"
+    if run_settings_helper "$CLAUDE_SETTINGS" claude "$CLAUDE_SETTINGS"; then
+        printf '%s\n' "$SETTINGS_OUT" | sed 's/^/  /'
+        success "Thinking display enabled in $CLAUDE_SETTINGS"
+    else
+        printf '%s\n' "$SETTINGS_OUT" | sed 's/^/  /' >&2
+        warn "Could not edit $CLAUDE_SETTINGS automatically (it was not changed). Add by hand:"
+        printf '\n  "alwaysThinkingEnabled": true,\n  "showThinkingSummaries": true\n\n'
+    fi
+fi
+
 # ---------- optional live smoke test -----------------------------------------
 section "Live smoke test (optional)"
 
-if confirm "Start a2o briefly and send one real request through it? (uses a few tokens)" Y; then
+if confirm "Start a2o briefly and send a few real requests through it? (uses a few hundred tokens)" Y; then
     SMOKE_PORT="$A2O_PORT"
-    if port_busy "$SMOKE_PORT"; then
-        SMOKE_PORT="$(( A2O_PORT + 1 ))"
+    for _try in 1 2 3 4 5 6 7 8 9 10; do
+        port_busy 127.0.0.1 "$SMOKE_PORT" || break
+        SMOKE_PORT=$(( SMOKE_PORT + 1 ))
+    done
+    if [[ "$SMOKE_PORT" != "$A2O_PORT" ]]; then
         warn "Port $A2O_PORT is busy; testing on port $SMOKE_PORT instead."
     fi
-    "$VENV_DIR/bin/a2o" --host 127.0.0.1 --port "$SMOKE_PORT" --upstream "$BASE_URL" --model "$MODEL" \
+
+    cat > "$TMP/smoke_lib.py" <<'SMOKEPY'
+"""Live smoke-test helper.  usage: smoke_lib.py body KIND | check KIND FILE
+check exit codes: 0 ok, 1 warning (works, but not what we hoped to see), 2 failure"""
+import json
+import sys
+
+TOOL = {
+    "name": "get_weather",
+    "description": "Get the weather for a city",
+    # the lookahead pattern is on purpose: it proves the schema sanitiser works upstream
+    "input_schema": {"type": "object", "required": ["city"],
+                     "properties": {"city": {"type": "string", "pattern": "^(?!-)[A-Za-z ]+$"}}},
+}
+
+
+def body(kind):
+    b = {"model": "claude-sonnet-4-5", "max_tokens": 300}
+    if kind == "basic":
+        b.update(system="You are terse.",
+                 messages=[{"role": "user", "content": "Reply with exactly: proxy ok"}])
+    elif kind == "think":
+        b.update(max_tokens=2048, stream=True, thinking={"type": "enabled", "budget_tokens": 1024},
+                 messages=[{"role": "user", "content": "What is 17*23? Answer with just the number."}])
+    elif kind == "tool":
+        b.update(tools=[TOOL],
+                 messages=[{"role": "user", "content": "What is the weather in Lagos? Use the tool."}])
+    elif kind == "history":
+        b.update(messages=[
+            {"role": "user", "content": "What is 17*23?"},
+            {"role": "assistant", "content": [
+                {"type": "thinking", "thinking": "17*23 = 391", "signature": "sig"},
+                {"type": "text", "text": "391"}]},
+            {"role": "user", "content": "Now double it. Answer with just the number."}])
+    else:
+        sys.exit("unknown kind " + kind)
+    print(json.dumps(b))
+
+
+def texts(content):
+    return " ".join(x.get("text", "") for x in content if x.get("type") == "text").strip()
+
+
+def check(kind, path):
+    raw = open(path, encoding="utf-8", errors="replace").read()
+    if kind == "think":
+        events = []
+        for line in raw.splitlines():
+            if line.startswith("data:"):
+                try:
+                    events.append(json.loads(line[5:].strip()))
+                except ValueError:
+                    pass
+        if not events:
+            print("no SSE events came back"); return 2
+        starts = [e["content_block"]["type"] for e in events if e.get("type") == "content_block_start"]
+        think = "".join(e["delta"].get("thinking", "") for e in events
+                        if e.get("delta", {}).get("type") == "thinking_delta")
+        text = "".join(e["delta"].get("text", "") for e in events
+                       if e.get("delta", {}).get("type") == "text_delta")
+        if "DSML" in text:
+            print("DSML markup leaked into the text stream"); return 2
+        if think.strip() and text.strip():
+            print("streaming OK: thinking block (%d chars) then text %r" % (len(think), text.strip()[:40])); return 0
+        print("streaming works but blocks were %s (thinking=%d chars, text=%d chars). "
+              "The model may not reason, or this provider names the field something else."
+              % (starts, len(think), len(text))); return 1
+    data = json.loads(raw)
+    if kind in ("basic", "history"):
+        t = texts(data.get("content", []))
+        if t:
+            print("model said: " + t[:80]); return 0
+        print("HTTP 200 but no text in the reply"); return 2
+    if kind == "tool":
+        uses = [b for b in data.get("content", []) if b.get("type") == "tool_use"]
+        if uses and data.get("stop_reason") == "tool_use":
+            print("tool_use %s %s" % (uses[0].get("name"), json.dumps(uses[0].get("input")))); return 0
+        print("request accepted (so the schema patch works) but the model chose not to call the tool"); return 1
+    return 2
+
+
+if __name__ == "__main__":
+    if sys.argv[1] == "body":
+        body(sys.argv[2])
+    else:
+        sys.exit(check(sys.argv[2], sys.argv[3]))
+SMOKEPY
+
+    smoke_post() {   # smoke_post OUTFILE JSON_BODY -> prints the HTTP status
+        printf 'header = "Authorization: Bearer %s"\n' "$TOKEN_VALUE" \
+            | curl -sS -K - --max-time 180 -o "$1" -w '%{http_code}' \
+                -H 'Content-Type: application/json' -H 'anthropic-version: 2023-06-01' \
+                -d "$2" "http://127.0.0.1:$SMOKE_PORT/v1/messages" 2>/dev/null
+    }
+
+    smoke_case() {   # smoke_case KIND LABEL -> 0 ok/warn, 1 failed
+        local kind="$1" label="$2" body code="" out="" rc=0
+        body="$("$PYTHON" "$TMP/smoke_lib.py" body "$kind")"
+        code="$(smoke_post "$TMP/smoke_$kind.out" "$body")" || code="000"
+        if [[ "$code" != "200" ]]; then
+            error "$label: HTTP $code $(head -c 300 "$TMP/smoke_$kind.out" 2>/dev/null)"
+            return 1
+        fi
+        out="$("$PYTHON" "$TMP/smoke_lib.py" check "$kind" "$TMP/smoke_$kind.out" 2>&1)" || rc=$?
+        case "$rc" in
+            0) success "$label: $out" ;;
+            1) warn "$label: $out" ;;
+            *) error "$label: $out"; return 1 ;;
+        esac
+    }
+
+    "$VENV_BIN/a2o$EXE" --host 127.0.0.1 --port "$SMOKE_PORT" --upstream "$BASE_URL" --model "$MODEL" \
         >"$LOG_FILE" 2>&1 &
     SMOKE_PID=$!
     READY=0
@@ -1086,20 +1550,12 @@ if confirm "Start a2o briefly and send one real request through it? (uses a few 
         error "a2o did not start. Last log lines:"; tail -n 15 "$LOG_FILE" >&2
         warn "Smoke test skipped; offline tests already passed."
     else
-        SM_BODY="$("$PYTHON" -c 'import json; print(json.dumps({"model": "claude-sonnet-4-5", "max_tokens": 200, "system": "You are terse.", "messages": [{"role": "user", "content": "Reply with exactly: proxy ok"}]}))')"
-        SM_CODE="$(printf 'header = "Authorization: Bearer %s"\n' "$TOKEN_VALUE" \
-            | curl -sS -K - --max-time 120 -o "$TMP/smoke.json" -w '%{http_code}' \
-                -H 'Content-Type: application/json' -H 'anthropic-version: 2023-06-01' \
-                -d "$SM_BODY" "http://127.0.0.1:$SMOKE_PORT/v1/messages" 2>/dev/null)" || SM_CODE="000"
-        if [[ "$SM_CODE" == "200" ]]; then
-            SM_TEXT="$("$PYTHON" -c 'import json,sys
-d = json.load(open(sys.argv[1]))
-print(" ".join(b.get("text","") for b in d.get("content", []) if b.get("type") == "text").strip()[:150])' "$TMP/smoke.json" 2>/dev/null || true)"
-            success "End to end works (system prompt + auth forwarded). Model said: ${SM_TEXT:-<no text>}"
-        else
-            error "Smoke test failed (HTTP $SM_CODE): $(head -c 400 "$TMP/smoke.json" 2>/dev/null)"
-            warn "Details: $LOG_FILE"
-        fi
+        SMOKE_FAILED=0
+        smoke_case basic   "1/4 plain request (system prompt + auth forwarded)" || SMOKE_FAILED=1
+        smoke_case think   "2/4 streaming + thinking"                           || SMOKE_FAILED=1
+        smoke_case tool    "3/4 tool call (schema has a lookahead pattern)"      || SMOKE_FAILED=1
+        smoke_case history "4/4 follow-up turn carrying a thinking block"       || SMOKE_FAILED=1
+        if [[ "$SMOKE_FAILED" -ne 0 ]]; then warn "Some smoke checks failed. Details: $LOG_FILE"; fi
     fi
     kill "$SMOKE_PID" 2>/dev/null || true
     wait "$SMOKE_PID" 2>/dev/null || true
@@ -1110,6 +1566,13 @@ fi
 
 # ---------- final output -----------------------------------------------------
 section "SETUP COMPLETE"
+if [[ "$THINKING" == "1" ]]; then
+    THINK_NOTE="Thinking display: configured (MAX_THINKING_TOKENS=$THINKING_TOKENS in VS Code settings;
+      alwaysThinkingEnabled + showThinkingSummaries in $CLAUDE_SETTINGS).
+      Reload VS Code and start a NEW Claude Code session to see it."
+else
+    THINK_NOTE="Thinking display: not configured. Re-run this script and say yes to enable it."
+fi
 cat <<EOF
 
   Provider        $PROVIDER_NAME
@@ -1129,13 +1592,11 @@ cat <<EOF
     - Your key is in plain text in settings.json (ANTHROPIC_AUTH_TOKEN) because a2o forwards
       whatever Authorization header Claude Code sends.
     - a2o has no /v1/messages/count_tokens route; if Claude Code complains about it, tell me.
-    - Thinking display: a2o now passes the model's reasoning to Claude Code as "thinking"
-      blocks. To see them, also add "alwaysThinkingEnabled": true and
-      "showThinkingSummaries": true to ~/.claude/settings.json, and a MAX_THINKING_TOKENS
-      entry (e.g. 16000) to claudeCode.environmentVariables, then reload VS Code.
+    - $THINK_NOTE
       Some providers silently serve a different model than the one you ask for; check the
       "model" field in a raw response if the behaviour looks off.
     - To change provider or model later, re-run this script and pick option 2 or 3.
     - Pristine copies of patched a2o files are kept next to them as *.orig.
+    - Settings backups are kept as *.bak.<timestamp> (mode 600); only the newest $BACKUPS_KEEP per file.
 
 EOF
